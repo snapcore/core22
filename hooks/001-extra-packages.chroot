@@ -153,6 +153,12 @@ PACKAGES+=(
     subiquitycore
 )
 
+# Initramfs
+PACKAGES+=(
+    busybox
+    snapd
+)
+
 case "$(dpkg --print-architecture)" in
     riscv64)
         ;;
