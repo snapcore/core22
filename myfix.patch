@@ -1,0 +1,803 @@
+diff --git a/debian/patches/debian/UBUNTU-read-only-etc-hacks.patch b/debian/patches/debian/UBUNTU-read-only-etc-hacks.patch
+deleted file mode 100644
+index 6498217c9..000000000
+--- a/debian/patches/debian/UBUNTU-read-only-etc-hacks.patch
++++ /dev/null
+@@ -1,291 +0,0 @@
+-From: Nick Rosbrook <nick.rosbrook@canonical.com>
+-Date: Fri, 21 Apr 2023 15:23:48 -0400
+-Subject: tree-wide: consolidate Ubuntu core's read-only /etc hacks
+-
+-Forwarded: no
+-Bug-Ubuntu: https://bugs.launchpad.net/ubuntu/+source/systemd/+bug/1981042
+-Bug-Ubuntu: https://bugs.launchpad.net/snappy/+bug/1953172
+-Bug-Ubuntu: https://launchpad.net/bugs/1227520
+-Bug-Ubuntu: https://bugs.launchpad.net/snappy/+bug/1650688
+-Last-Update: 2023-04-27
+----
+- src/basic/meson.build     |  1 +
+- src/basic/ro-etc-hack.c   | 27 +++++++++++++++++++++++++++
+- src/basic/ro-etc-hack.h   |  6 ++++++
+- src/basic/time-util.c     |  3 ++-
+- src/core/manager.c        |  5 +++--
+- src/firstboot/firstboot.c |  7 ++++---
+- src/hostname/hostnamed.c  | 15 ++++++++-------
+- src/timedate/timedated.c  | 11 ++++++-----
+- 8 files changed, 57 insertions(+), 18 deletions(-)
+- create mode 100644 src/basic/ro-etc-hack.c
+- create mode 100644 src/basic/ro-etc-hack.h
+-
+-diff --git a/src/basic/meson.build b/src/basic/meson.build
+-index 7aae031..cccf013 100644
+---- a/src/basic/meson.build
+-+++ b/src/basic/meson.build
+-@@ -70,6 +70,7 @@ basic_sources = files(
+-         'recurse-dir.c',
+-         'replace-var.c',
+-         'rlimit-util.c',
+-+        'ro-etc-hack.c',
+-         'sigbus.c',
+-         'signal-util.c',
+-         'siphash24.c',
+-diff --git a/src/basic/ro-etc-hack.c b/src/basic/ro-etc-hack.c
+-new file mode 100644
+-index 0000000..f1db71c
+---- /dev/null
+-+++ b/src/basic/ro-etc-hack.c
+-@@ -0,0 +1,27 @@
+-+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+-+
+-+#include <errno.h>
+-+#include <linux/limits.h>
+-+#include <stdio.h>
+-+
+-+#include "alloc-util.h"
+-+#include "fs-util.h"
+-+#include "ro-etc-hack.h"
+-+#include "string-util-fundamental.h"
+-+
+-+const char* writable_filename(const char *path) {
+-+        ssize_t r;
+-+        static char realfile_buf[PATH_MAX];
+-+        _cleanup_free_ char *realfile = NULL;
+-+        const char *result = path;
+-+        int orig_errno = errno;
+-+
+-+        r = readlink_and_make_absolute(path, &realfile);
+-+        if (r >= 0 && startswith(realfile, "/etc/writable")) {
+-+                snprintf(realfile_buf, sizeof(realfile_buf), "%s", realfile);
+-+                result = realfile_buf;
+-+        }
+-+
+-+        errno = orig_errno;
+-+        return result;
+-+}
+-diff --git a/src/basic/ro-etc-hack.h b/src/basic/ro-etc-hack.h
+-new file mode 100644
+-index 0000000..2ef881f
+---- /dev/null
+-+++ b/src/basic/ro-etc-hack.h
+-@@ -0,0 +1,6 @@
+-+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+-+#pragma once
+-+
+-+/* Hack for Ubuntu phone: check if path is an existing symlink to
+-+ * /etc/writable; if it is, update that instead */
+-+const char *writable_filename(const char *path);
+-diff --git a/src/basic/time-util.c b/src/basic/time-util.c
+-index 0bea149..0ad187a 100644
+---- a/src/basic/time-util.c
+-+++ b/src/basic/time-util.c
+-@@ -22,6 +22,7 @@
+- #include "parse-util.h"
+- #include "path-util.h"
+- #include "process-util.h"
+-+#include "ro-etc-hack.h"
+- #include "stat-util.h"
+- #include "string-table.h"
+- #include "string-util.h"
+-@@ -1479,7 +1480,7 @@ int get_timezone(char **ret) {
+-         char *z;
+-         int r;
+- 
+--        r = readlink_malloc("/etc/localtime", &t);
+-+        r = readlink_malloc(writable_filename("/etc/localtime"), &t);
+-         if (r == -ENOENT) {
+-                 /* If the symlink does not exist, assume "UTC", like glibc does */
+-                 z = strdup("UTC");
+-diff --git a/src/core/manager.c b/src/core/manager.c
+-index 1853526..8dd87e1 100644
+---- a/src/core/manager.c
+-+++ b/src/core/manager.c
+-@@ -72,6 +72,7 @@
+- #include "ratelimit.h"
+- #include "rlimit-util.h"
+- #include "rm-rf.h"
+-+#include "ro-etc-hack.h"
+- #include "selinux-util.h"
+- #include "signal-util.h"
+- #include "socket-util.h"
+-@@ -433,7 +434,7 @@ static int manager_read_timezone_stat(Manager *m) {
+-         assert(m);
+- 
+-         /* Read the current stat() data of /etc/localtime so that we detect changes */
+--        if (lstat("/etc/localtime", &st) < 0) {
+-+        if (lstat(writable_filename("/etc/localtime"), &st) < 0) {
+-                 log_debug_errno(errno, "Failed to stat /etc/localtime, ignoring: %m");
+-                 changed = m->etc_localtime_accessible;
+-                 m->etc_localtime_accessible = false;
+-@@ -470,7 +471,7 @@ static int manager_setup_timezone_change(Manager *m) {
+-          * Note that we create the new event source first here, before releasing the old one. This should optimize
+-          * behaviour as this way sd-event can reuse the old watch in case the inode didn't change. */
+- 
+--        r = sd_event_add_inotify(m->event, &new_event, "/etc/localtime",
+-+        r = sd_event_add_inotify(m->event, &new_event, writable_filename("/etc/localtime"),
+-                                  IN_ATTRIB|IN_MOVE_SELF|IN_CLOSE_WRITE|IN_DONT_FOLLOW, manager_dispatch_timezone_change, m);
+-         if (r == -ENOENT) {
+-                 /* If the file doesn't exist yet, subscribe to /etc instead, and wait until it is created either by
+-diff --git a/src/firstboot/firstboot.c b/src/firstboot/firstboot.c
+-index 9e79f84..ccc638e 100644
+---- a/src/firstboot/firstboot.c
+-+++ b/src/firstboot/firstboot.c
+-@@ -35,6 +35,7 @@
+- #include "proc-cmdline.h"
+- #include "pwquality-util.h"
+- #include "random-util.h"
+-+#include "ro-etc-hack.h"
+- #include "smack-util.h"
+- #include "string-util.h"
+- #include "strv.h"
+-@@ -480,7 +481,7 @@ static int process_timezone(void) {
+-         const char *etc_localtime, *e;
+-         int r;
+- 
+--        etc_localtime = prefix_roota(arg_root, "/etc/localtime");
+-+        etc_localtime = prefix_roota(arg_root, writable_filename("/etc/localtime"));
+-         if (laccess(etc_localtime, F_OK) >= 0 && !arg_force) {
+-                 log_debug("Found %s, assuming timezone has been configured.",
+-                           etc_localtime);
+-@@ -490,7 +491,7 @@ static int process_timezone(void) {
+-         if (arg_copy_timezone && arg_root) {
+-                 _cleanup_free_ char *p = NULL;
+- 
+--                r = readlink_malloc("/etc/localtime", &p);
+-+                r = readlink_malloc(writable_filename("/etc/localtime"), &p);
+-                 if (r != -ENOENT) {
+-                         if (r < 0)
+-                                 return log_error_errno(r, "Failed to read host timezone: %m");
+-@@ -512,7 +513,7 @@ static int process_timezone(void) {
+-         if (isempty(arg_timezone))
+-                 return 0;
+- 
+--        e = strjoina("../usr/share/zoneinfo/", arg_timezone);
+-+        e = strjoina("/usr/share/zoneinfo/", arg_timezone);
+- 
+-         (void) mkdir_parents(etc_localtime, 0755);
+-         r = symlink_atomic(e, etc_localtime);
+-diff --git a/src/hostname/hostnamed.c b/src/hostname/hostnamed.c
+-index 36ab014..ff3a5eb 100644
+---- a/src/hostname/hostnamed.c
+-+++ b/src/hostname/hostnamed.c
+-@@ -28,6 +28,7 @@
+- #include "os-util.h"
+- #include "parse-util.h"
+- #include "path-util.h"
+-+#include "ro-etc-hack.h"
+- #include "sd-device.h"
+- #include "selinux-util.h"
+- #include "service-util.h"
+-@@ -119,7 +120,7 @@ static void context_read_machine_info(Context *c) {
+- 
+-         assert(c);
+- 
+--        if (stat("/etc/machine-info", &current_stat) >= 0 &&
+-+        if (stat(writable_filename("/etc/machine-info"), &current_stat) >= 0 &&
+-             stat_inode_unmodified(&c->etc_machine_info_stat, &current_stat))
+-                 return;
+- 
+-@@ -132,7 +133,7 @@ static void context_read_machine_info(Context *c) {
+-                       (UINT64_C(1) << PROP_HARDWARE_VENDOR) |
+-                       (UINT64_C(1) << PROP_HARDWARE_MODEL));
+- 
+--        r = parse_env_file(NULL, "/etc/machine-info",
+-+        r = parse_env_file(NULL, writable_filename("/etc/machine-info"),
+-                            "PRETTY_HOSTNAME", &c->data[PROP_PRETTY_HOSTNAME],
+-                            "ICON_NAME", &c->data[PROP_ICON_NAME],
+-                            "CHASSIS", &c->data[PROP_CHASSIS],
+-@@ -578,14 +579,14 @@ static int context_write_data_static_hostname(Context *c) {
+-         s = &c->etc_hostname_stat;
+- 
+-         if (isempty(c->data[PROP_STATIC_HOSTNAME])) {
+--                if (unlink("/etc/hostname") < 0 && errno != ENOENT)
+-+                if (unlink(writable_filename("/etc/hostname")) < 0 && errno != ENOENT)
+-                         return -errno;
+- 
+-                 TAKE_PTR(s);
+-                 return 0;
+-         }
+- 
+--        r = write_string_file_atomic_label("/etc/hostname", c->data[PROP_STATIC_HOSTNAME]);
+-+        r = write_string_file_atomic_label(writable_filename("/etc/hostname"), c->data[PROP_STATIC_HOSTNAME]);
+-         if (r < 0)
+-                 return r;
+- 
+-@@ -611,7 +612,7 @@ static int context_write_data_machine_info(Context *c) {
+-          * already, even if we can't make it hit the disk. */
+-         s = &c->etc_machine_info_stat;
+- 
+--        r = load_env_file(NULL, "/etc/machine-info", &l);
+-+        r = load_env_file(NULL, writable_filename("/etc/machine-info"), &l);
+-         if (r < 0 && r != -ENOENT)
+-                 return r;
+- 
+-@@ -624,14 +625,14 @@ static int context_write_data_machine_info(Context *c) {
+-         }
+- 
+-         if (strv_isempty(l)) {
+--                if (unlink("/etc/machine-info") < 0 && errno != ENOENT)
+-+                if (unlink(writable_filename("/etc/machine-info")) < 0 && errno != ENOENT)
+-                         return -errno;
+- 
+-                 TAKE_PTR(s);
+-                 return 0;
+-         }
+- 
+--        r = write_env_file_label("/etc/machine-info", l);
+-+        r = write_env_file_label(writable_filename("/etc/machine-info"), l);
+-         if (r < 0)
+-                 return r;
+- 
+-diff --git a/src/timedate/timedated.c b/src/timedate/timedated.c
+-index ad48330..3f60106 100644
+---- a/src/timedate/timedated.c
+-+++ b/src/timedate/timedated.c
+-@@ -31,6 +31,7 @@
+- #include "memory-util.h"
+- #include "missing_capability.h"
+- #include "path-util.h"
+-+#include "ro-etc-hack.h"
+- #include "selinux-util.h"
+- #include "service-util.h"
+- #include "signal-util.h"
+-@@ -308,22 +309,22 @@ static int context_write_data_timezone(Context *c) {
+- 
+-                 if (access("/usr/share/zoneinfo/UTC", F_OK) < 0) {
+- 
+--                        if (unlink("/etc/localtime") < 0 && errno != ENOENT)
+-+                        if (unlink(writable_filename("/etc/localtime")) < 0 && errno != ENOENT)
+-                                 return -errno;
+- 
+-                         return 0;
+-                 }
+- 
+--                source = "../usr/share/zoneinfo/UTC";
+-+                source = "/usr/share/zoneinfo/UTC";
+-         } else {
+--                p = path_join("../usr/share/zoneinfo", c->zone);
+-+                p = path_join("/usr/share/zoneinfo", c->zone);
+-                 if (!p)
+-                         return -ENOMEM;
+- 
+-                 source = p;
+-         }
+- 
+--        return symlink_atomic(source, "/etc/localtime");
+-+        return symlink_atomic(source, writable_filename("/etc/localtime"));
+- }
+- 
+- static int context_write_data_local_rtc(Context *c) {
+-@@ -384,7 +385,7 @@ static int context_write_data_local_rtc(Context *c) {
+-                 *(char*) mempcpy(stpcpy(stpcpy(mempcpy(w, s, a), prepend), c->local_rtc ? "LOCAL" : "UTC"), e, b) = 0;
+- 
+-                 if (streq(w, NULL_ADJTIME_UTC)) {
+--                        if (unlink("/etc/adjtime") < 0)
+-+                        if (unlink(writable_filename("/etc/adjtime")) < 0)
+-                                 if (errno != ENOENT)
+-                                         return -errno;
+- 
+diff --git a/debian/patches/myfix.patch b/debian/patches/myfix.patch
+new file mode 100644
+index 000000000..59de1d871
+--- /dev/null
++++ b/debian/patches/myfix.patch
+@@ -0,0 +1,483 @@
++Index: systemd-ubuntu/src/basic/time-util.c
++===================================================================
++--- systemd-ubuntu.orig/src/basic/time-util.c
+++++ systemd-ubuntu/src/basic/time-util.c
++@@ -1474,12 +1474,14 @@ bool clock_supported(clockid_t clock) {
++ }
++ 
++ int get_timezone(char **ret) {
++-        _cleanup_free_ char *t = NULL;
++-        const char *e;
+++        _cleanup_free_ char *t = NULL, *link_dir = NULL, *abspath = NULL;
+++        const char *e, *link_path;
++         char *z;
++         int r;
++ 
++-        r = readlink_malloc("/etc/localtime", &t);
+++        link_path = etc_localtime();
+++
+++        r = readlink_malloc(link_path, &t);
++         if (r == -ENOENT) {
++                 /* If the symlink does not exist, assume "UTC", like glibc does */
++                 z = strdup("UTC");
++@@ -1492,7 +1494,15 @@ int get_timezone(char **ret) {
++         if (r < 0)
++                 return r; /* returns EINVAL if not a symlink */
++ 
++-        e = PATH_STARTSWITH_SET(t, "/usr/share/zoneinfo/", "../usr/share/zoneinfo/");
+++        r = path_extract_directory(link_path, &link_dir);
+++        if (r < 0)
+++                return r;
+++
+++        abspath = path_make_absolute(t, link_dir);
+++        if (!abspath)
+++                return -ENOMEM;
+++
+++        e = path_startswith(abspath, "/usr/share/zoneinfo/");
++         if (!e)
++                 return -EINVAL;
++ 
++@@ -1507,6 +1517,10 @@ int get_timezone(char **ret) {
++         return 0;
++ }
++ 
+++const char *etc_localtime(void) {
+++        return secure_getenv("SYSTEMD_ETC_LOCALTIME") ?: "/etc/localtime";
+++}
+++
++ time_t mktime_or_timegm(struct tm *tm, bool utc) {
++         return utc ? timegm(tm) : mktime(tm);
++ }
++Index: systemd-ubuntu/src/basic/time-util.h
++===================================================================
++--- systemd-ubuntu.orig/src/basic/time-util.h
+++++ systemd-ubuntu/src/basic/time-util.h
++@@ -162,6 +162,8 @@ usec_t usec_shift_clock(usec_t, clockid_
++ 
++ int get_timezone(char **timezone);
++ 
+++const char *etc_localtime(void);
+++
++ time_t mktime_or_timegm(struct tm *tm, bool utc);
++ struct tm *localtime_or_gmtime_r(const time_t *t, struct tm *tm, bool utc);
++ 
++Index: systemd-ubuntu/src/core/manager.c
++===================================================================
++--- systemd-ubuntu.orig/src/core/manager.c
+++++ systemd-ubuntu/src/core/manager.c
++@@ -433,7 +433,7 @@ static int manager_read_timezone_stat(Ma
++         assert(m);
++ 
++         /* Read the current stat() data of /etc/localtime so that we detect changes */
++-        if (lstat("/etc/localtime", &st) < 0) {
+++        if (lstat(etc_localtime(), &st) < 0) {
++                 log_debug_errno(errno, "Failed to stat /etc/localtime, ignoring: %m");
++                 changed = m->etc_localtime_accessible;
++                 m->etc_localtime_accessible = false;
++@@ -470,7 +470,7 @@ static int manager_setup_timezone_change
++          * Note that we create the new event source first here, before releasing the old one. This should optimize
++          * behaviour as this way sd-event can reuse the old watch in case the inode didn't change. */
++ 
++-        r = sd_event_add_inotify(m->event, &new_event, "/etc/localtime",
+++        r = sd_event_add_inotify(m->event, &new_event, etc_localtime(),
++                                  IN_ATTRIB|IN_MOVE_SELF|IN_CLOSE_WRITE|IN_DONT_FOLLOW, manager_dispatch_timezone_change, m);
++         if (r == -ENOENT) {
++                 /* If the file doesn't exist yet, subscribe to /etc instead, and wait until it is created either by
++Index: systemd-ubuntu/src/firstboot/firstboot.c
++===================================================================
++--- systemd-ubuntu.orig/src/firstboot/firstboot.c
+++++ systemd-ubuntu/src/firstboot/firstboot.c
++@@ -309,13 +309,19 @@ static int prompt_locale(void) {
++         return 0;
++ }
++ 
+++static const char *etc_locale_conf(void) {
+++        return secure_getenv("SYSTEMD_ETC_LOCALE_CONF") ?: "/etc/locale.conf";
+++}
+++
++ static int process_locale(void) {
++         const char *etc_localeconf;
+++        const char* locale_conf_path;
++         char* locales[3];
++         unsigned i = 0;
++         int r;
++ 
++-        etc_localeconf = prefix_roota(arg_root, "/etc/locale.conf");
+++        locale_conf_path = etc_locale_conf();
+++        etc_localeconf = prefix_roota(arg_root, locale_conf_path);
++         if (laccess(etc_localeconf, F_OK) >= 0 && !arg_force) {
++                 log_debug("Found %s, assuming locale information has been configured.",
++                           etc_localeconf);
++@@ -325,7 +331,7 @@ static int process_locale(void) {
++         if (arg_copy_locale && arg_root) {
++ 
++                 (void) mkdir_parents(etc_localeconf, 0755);
++-                r = copy_file("/etc/locale.conf", etc_localeconf, 0, 0644, 0, 0, COPY_REFLINK);
+++                r = copy_file(locale_conf_path, etc_localeconf, 0, 0644, 0, 0, COPY_REFLINK);
++                 if (r != -ENOENT) {
++                         if (r < 0)
++                                 return log_error_errno(r, "Failed to copy %s: %m", etc_localeconf);
++@@ -390,12 +396,18 @@ static int prompt_keymap(void) {
++                            kmaps, 60, keymap_is_valid, &arg_keymap);
++ }
++ 
+++static const char *etc_vconsole_conf(void) {
+++        return secure_getenv("SYSTEMD_ETC_VCONSOLE_CONF") ?: "/etc/vconsole.conf";
+++}
+++
++ static int process_keymap(void) {
++         const char *etc_vconsoleconf;
+++        const char* vconsole_conf_path;
++         char **keymap;
++         int r;
++ 
++-        etc_vconsoleconf = prefix_roota(arg_root, "/etc/vconsole.conf");
+++        vconsole_conf_path = etc_vconsole_conf();
+++        etc_vconsoleconf = prefix_roota(arg_root, vconsole_conf_path);
++         if (laccess(etc_vconsoleconf, F_OK) >= 0 && !arg_force) {
++                 log_debug("Found %s, assuming console has been configured.",
++                           etc_vconsoleconf);
++@@ -477,30 +489,31 @@ static int prompt_timezone(void) {
++ }
++ 
++ static int process_timezone(void) {
++-        const char *etc_localtime, *e;
+++        const char *etc_localtime_root, *e, *localtime_path;
++         int r;
++ 
++-        etc_localtime = prefix_roota(arg_root, "/etc/localtime");
++-        if (laccess(etc_localtime, F_OK) >= 0 && !arg_force) {
+++        localtime_path = etc_localtime();
+++        etc_localtime_root = prefix_roota(arg_root, localtime_path);
+++        if (laccess(etc_localtime_root, F_OK) >= 0 && !arg_force) {
++                 log_debug("Found %s, assuming timezone has been configured.",
++-                          etc_localtime);
+++                          etc_localtime_root);
++                 return 0;
++         }
++ 
++         if (arg_copy_timezone && arg_root) {
++                 _cleanup_free_ char *p = NULL;
++ 
++-                r = readlink_malloc("/etc/localtime", &p);
+++                r = readlink_malloc(localtime_path, &p);
++                 if (r != -ENOENT) {
++                         if (r < 0)
++                                 return log_error_errno(r, "Failed to read host timezone: %m");
++ 
++-                        (void) mkdir_parents(etc_localtime, 0755);
++-                        r = symlink_atomic(p, etc_localtime);
+++                        (void) mkdir_parents(etc_localtime_root, 0755);
+++                        r = symlink_atomic(p, etc_localtime_root);
++                         if (r < 0)
++-                                return log_error_errno(r, "Failed to create %s symlink: %m", etc_localtime);
+++                                return log_error_errno(r, "Failed to create %s symlink: %m", etc_localtime_root);
++ 
++-                        log_info("%s copied.", etc_localtime);
+++                        log_info("%s copied.", etc_localtime_root);
++                         return 0;
++                 }
++         }
++@@ -512,14 +525,14 @@ static int process_timezone(void) {
++         if (isempty(arg_timezone))
++                 return 0;
++ 
++-        e = strjoina("../usr/share/zoneinfo/", arg_timezone);
+++        e = strjoina("/usr/share/zoneinfo/", arg_timezone);
++ 
++-        (void) mkdir_parents(etc_localtime, 0755);
++-        r = symlink_atomic(e, etc_localtime);
+++        (void) mkdir_parents(etc_localtime_root, 0755);
+++        r = symlinkat_atomic_full(e, AT_FDCWD, etc_localtime_root, /* make_relative= */true);
++         if (r < 0)
++-                return log_error_errno(r, "Failed to create %s symlink: %m", etc_localtime);
+++                return log_error_errno(r, "Failed to create %s symlink: %m", etc_localtime_root);
++ 
++-        log_info("%s written", etc_localtime);
+++        log_info("%s written", etc_localtime_root);
++         return 0;
++ }
++ 
++Index: systemd-ubuntu/src/hostname/hostnamed.c
++===================================================================
++--- systemd-ubuntu.orig/src/hostname/hostnamed.c
+++++ systemd-ubuntu/src/hostname/hostnamed.c
++@@ -567,25 +567,31 @@ static void unset_statp(struct stat **p)
++         **p = (struct stat) {};
++ }
++ 
+++static const char *etc_hostname(void) {
+++        return secure_getenv("SYSTEMD_ETC_HOSTNAME") ?: "/etc/hostname";
+++}
+++
++ static int context_write_data_static_hostname(Context *c) {
++         _cleanup_(unset_statp) struct stat *s = NULL;
+++        const char *hostname_path = NULL;
++         int r;
++ 
++         assert(c);
++ 
+++        hostname_path = etc_hostname();
++         /* Make sure that if we fail here, we invalidate the cached information, since it was updated
++          * already, even if we can't make it hit the disk. */
++         s = &c->etc_hostname_stat;
++ 
++         if (isempty(c->data[PROP_STATIC_HOSTNAME])) {
++-                if (unlink("/etc/hostname") < 0 && errno != ENOENT)
+++                if (unlink(hostname_path) < 0 && errno != ENOENT)
++                         return -errno;
++ 
++                 TAKE_PTR(s);
++                 return 0;
++         }
++ 
++-        r = write_string_file_atomic_label("/etc/hostname", c->data[PROP_STATIC_HOSTNAME]);
+++        r = write_string_file_atomic_label(hostname_path, c->data[PROP_STATIC_HOSTNAME]);
++         if (r < 0)
++                 return r;
++ 
++@@ -593,6 +599,10 @@ static int context_write_data_static_hos
++         return 0;
++ }
++ 
+++static const char *etc_machine_info(void) {
+++        return secure_getenv("SYSTEMD_ETC_MACHINE_INFO") ?: "/etc/machine-info";
+++}
+++
++ static int context_write_data_machine_info(Context *c) {
++         _cleanup_(unset_statp) struct stat *s = NULL;
++         static const char * const name[_PROP_MAX] = {
++@@ -603,15 +613,18 @@ static int context_write_data_machine_in
++                 [PROP_LOCATION] = "LOCATION",
++         };
++         _cleanup_strv_free_ char **l = NULL;
+++        const char* machine_info_path;
++         int r;
++ 
++         assert(c);
++ 
+++        machine_info_path = etc_machine_info();
+++
++         /* Make sure that if we fail here, we invalidate the cached information, since it was updated
++          * already, even if we can't make it hit the disk. */
++         s = &c->etc_machine_info_stat;
++ 
++-        r = load_env_file(NULL, "/etc/machine-info", &l);
+++        r = load_env_file(NULL, machine_info_path, &l);
++         if (r < 0 && r != -ENOENT)
++                 return r;
++ 
++@@ -624,14 +637,14 @@ static int context_write_data_machine_in
++         }
++ 
++         if (strv_isempty(l)) {
++-                if (unlink("/etc/machine-info") < 0 && errno != ENOENT)
+++                if (unlink(machine_info_path) < 0 && errno != ENOENT)
++                         return -errno;
++ 
++                 TAKE_PTR(s);
++                 return 0;
++         }
++ 
++-        r = write_env_file_label("/etc/machine-info", l);
+++        r = write_env_file_label(machine_info_path, l);
++         if (r < 0)
++                 return r;
++ 
++Index: systemd-ubuntu/src/shared/machine-id-setup.c
++===================================================================
++--- systemd-ubuntu.orig/src/shared/machine-id-setup.c
+++++ systemd-ubuntu/src/shared/machine-id-setup.c
++@@ -81,13 +81,17 @@ static int generate_machine_id(const cha
++         return 0;
++ }
++ 
+++static const char *etc_machine_id(void) {
+++        return secure_getenv("SYSTEMD_ETC_MACHINE_ID") ?: "/etc/machine-id";
+++}
+++
++ int machine_id_setup(const char *root, bool force_transient, sd_id128_t machine_id, sd_id128_t *ret) {
++-        const char *etc_machine_id, *run_machine_id;
+++        const char *etc_machine_id_path, *run_machine_id;
++         _cleanup_close_ int fd = -EBADF;
++         bool writable;
++         int r;
++ 
++-        etc_machine_id = prefix_roota(root, "/etc/machine-id");
+++        etc_machine_id_path = prefix_roota(root, etc_machine_id());
++ 
++         WITH_UMASK(0000) {
++                 /* We create this 0444, to indicate that this isn't really
++@@ -95,12 +99,12 @@ int machine_id_setup(const char *root, b
++                  * will be owned by root it doesn't matter much, but maybe
++                  * people look. */
++ 
++-                (void) mkdir_parents(etc_machine_id, 0755);
++-                fd = open(etc_machine_id, O_RDWR|O_CREAT|O_CLOEXEC|O_NOCTTY, 0444);
+++                (void) mkdir_parents(etc_machine_id_path, 0755);
+++                fd = open(etc_machine_id_path, O_RDWR|O_CREAT|O_CLOEXEC|O_NOCTTY, 0444);
++                 if (fd < 0) {
++                         int old_errno = errno;
++ 
++-                        fd = open(etc_machine_id, O_RDONLY|O_CLOEXEC|O_NOCTTY);
+++                        fd = open(etc_machine_id_path, O_RDONLY|O_CLOEXEC|O_NOCTTY);
++                         if (fd < 0) {
++                                 if (old_errno == EROFS && errno == ENOENT)
++                                         return log_error_errno(errno,
++@@ -110,7 +114,7 @@ int machine_id_setup(const char *root, b
++                                                   "2) /etc/machine-id exists and is empty.\n"
++                                                   "3) /etc/machine-id is missing and /etc is writable.\n");
++                                 else
++-                                        return log_error_errno(errno, "Cannot open %s: %m", etc_machine_id);
+++                                        return log_error_errno(errno, "Cannot open %s: %m", etc_machine_id_path);
++                         }
++ 
++                         writable = false;
++@@ -133,10 +137,10 @@ int machine_id_setup(const char *root, b
++ 
++         if (writable) {
++                 if (lseek(fd, 0, SEEK_SET) == (off_t) -1)
++-                        return log_error_errno(errno, "Failed to seek %s: %m", etc_machine_id);
+++                        return log_error_errno(errno, "Failed to seek %s: %m", etc_machine_id_path);
++ 
++                 if (ftruncate(fd, 0) < 0)
++-                        return log_error_errno(errno, "Failed to truncate %s: %m", etc_machine_id);
+++                        return log_error_errno(errno, "Failed to truncate %s: %m", etc_machine_id_path);
++ 
++                 /* If the caller requested a transient machine-id, write the string "uninitialized\n" to
++                  * disk and overmount it with a transient file.
++@@ -145,15 +149,15 @@ int machine_id_setup(const char *root, b
++                 if (force_transient) {
++                         r = loop_write(fd, "uninitialized\n", strlen("uninitialized\n"), false);
++                         if (r < 0)
++-                                return log_error_errno(r, "Failed to write uninitialized %s: %m", etc_machine_id);
+++                                return log_error_errno(r, "Failed to write uninitialized %s: %m", etc_machine_id_path);
++ 
++                         r = fsync_full(fd);
++                         if (r < 0)
++-                                return log_error_errno(r, "Failed to sync %s: %m", etc_machine_id);
+++                                return log_error_errno(r, "Failed to sync %s: %m", etc_machine_id_path);
++                 } else {
++                         r = id128_write_fd(fd, ID128_FORMAT_PLAIN | ID128_SYNC_ON_WRITE, machine_id);
++                         if (r < 0)
++-                                return log_error_errno(r, "Failed to write %s: %m", etc_machine_id);
+++                                return log_error_errno(r, "Failed to write %s: %m", etc_machine_id_path);
++                         else
++                                 goto finish;
++                 }
++@@ -164,6 +168,7 @@ int machine_id_setup(const char *root, b
++         /* Hmm, we couldn't or shouldn't write the machine-id to /etc?
++          * So let's write it to /run/machine-id as a replacement */
++ 
+++        etc_machine_id_path = prefix_roota(root, "/etc/machine-id");
++         run_machine_id = prefix_roota(root, "/run/machine-id");
++ 
++         WITH_UMASK(0022)
++@@ -174,16 +179,16 @@ int machine_id_setup(const char *root, b
++         }
++ 
++         /* And now, let's mount it over */
++-        r = mount_follow_verbose(LOG_ERR, run_machine_id, etc_machine_id, NULL, MS_BIND, NULL);
+++        r = mount_follow_verbose(LOG_ERR, run_machine_id, etc_machine_id_path, NULL, MS_BIND, NULL);
++         if (r < 0) {
++                 (void) unlink(run_machine_id);
++                 return r;
++         }
++ 
++-        log_full(force_transient ? LOG_DEBUG : LOG_INFO, "Installed transient %s file.", etc_machine_id);
+++        log_full(force_transient ? LOG_DEBUG : LOG_INFO, "Installed transient %s file.", etc_machine_id_path);
++ 
++         /* Mark the mount read-only */
++-        r = mount_follow_verbose(LOG_WARNING, NULL, etc_machine_id, NULL, MS_BIND|MS_RDONLY|MS_REMOUNT, NULL);
+++        r = mount_follow_verbose(LOG_WARNING, NULL, etc_machine_id_path, NULL, MS_BIND|MS_RDONLY|MS_REMOUNT, NULL);
++         if (r < 0)
++                 return r;
++ 
++Index: systemd-ubuntu/src/timedate/timedated.c
++===================================================================
++--- systemd-ubuntu.orig/src/timedate/timedated.c
+++++ systemd-ubuntu/src/timedate/timedated.c
++@@ -294,8 +294,9 @@ static int context_read_data(Context *c)
++ }
++ 
++ static int context_write_data_timezone(Context *c) {
++-        _cleanup_free_ char *p = NULL;
++-        const char *source;
+++        _cleanup_free_ char *p = NULL, *link_dir = NULL, *relpath;
+++        const char *source, *link_path;
+++        int r;
++ 
++         assert(c);
++ 
++@@ -308,31 +309,48 @@ static int context_write_data_timezone(C
++ 
++                 if (access("/usr/share/zoneinfo/UTC", F_OK) < 0) {
++ 
++-                        if (unlink("/etc/localtime") < 0 && errno != ENOENT)
+++                        if (unlink(etc_localtime()) < 0 && errno != ENOENT)
++                                 return -errno;
++ 
++                         return 0;
++                 }
++ 
++-                source = "../usr/share/zoneinfo/UTC";
+++                source = "/usr/share/zoneinfo/UTC";
++         } else {
++-                p = path_join("../usr/share/zoneinfo", c->zone);
+++                p = path_join("/usr/share/zoneinfo", c->zone);
++                 if (!p)
++                         return -ENOMEM;
++ 
++                 source = p;
++         }
++ 
++-        return symlink_atomic(source, "/etc/localtime");
+++        link_path = etc_localtime();
+++
+++        r = path_extract_directory(link_path, &link_dir);
+++        if (r < 0)
+++                return r;
+++
+++        r = path_make_relative(link_dir, source, &relpath);
+++        if (r < 0)
+++                return r;
+++
+++        return symlink_atomic(relpath, link_path);
+++}
+++
+++static const char *etc_adjtime(void) {
+++        return secure_getenv("SYSTEMD_ETC_ADJTIME") ?: "/etc/adjtime";
++ }
++ 
++ static int context_write_data_local_rtc(Context *c) {
++         _cleanup_free_ char *s = NULL, *w = NULL;
+++        const char* adjtime_path;
++         int r;
++ 
++         assert(c);
++ 
++-        r = read_full_file("/etc/adjtime", &s, NULL);
+++        adjtime_path = etc_adjtime();
+++
+++        r = read_full_file(adjtime_path, &s, NULL);
++         if (r < 0) {
++                 if (r != -ENOENT)
++                         return r;
++@@ -384,7 +402,7 @@ static int context_write_data_local_rtc(
++                 *(char*) mempcpy(stpcpy(stpcpy(mempcpy(w, s, a), prepend), c->local_rtc ? "LOCAL" : "UTC"), e, b) = 0;
++ 
++                 if (streq(w, NULL_ADJTIME_UTC)) {
++-                        if (unlink("/etc/adjtime") < 0)
+++                        if (unlink(adjtime_path) < 0)
++                                 if (errno != ENOENT)
++                                         return -errno;
++ 
++@@ -396,7 +414,7 @@ static int context_write_data_local_rtc(
++         if (r < 0)
++                 return r;
++ 
++-        return write_string_file_atomic_label("/etc/adjtime", w);
+++        return write_string_file_atomic_label(adjtime_path, w);
++ }
++ 
++ static int context_update_ntp_status(Context *c, sd_bus *bus, sd_bus_message *m) {
+diff --git a/debian/patches/series b/debian/patches/series
+index 54b69d8c9..79fef4088 100644
+--- a/debian/patches/series
++++ b/debian/patches/series
+@@ -22,7 +22,6 @@ test-increase-QEMU_MEM-for-some-tests.patch
+ test-denylist-TEST-29-PORTABLE-again.patch
+ debian/Skip-flaky-test_resolved_domain_restricted_dns-in-network.patch
+ debian/localectl-disable-keymap-support.patch
+-debian/UBUNTU-read-only-etc-hacks.patch
+ test-drop-etc-default-locale-handling-from-TEST-74-AUX-UT.patch
+ test-skip-tests-for-unsupported-localectl-features.patch
+ lp2013543-core-reorder-systemd-arguments-on-reexec.patch
+@@ -30,3 +29,4 @@ lp2009743/network-dhcp4-do-not-ignore-the-gateway-even-if-the-desti.patch
+ lp2009743/test-network-add-one-more-testcase-for-DHCPv4-classless-r.patch
+ meson.build-disable-Wformat-overflow-on-gcc-with-O3.patch
+ lp2033325-Revert-core-service-when-resetting-PID-also-reset-known-f.patch
++myfix.patch

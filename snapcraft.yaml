@@ -48,6 +48,26 @@ parts:
     prime:
       - -local-debs
 
+  systemd:
+    build-packages:
+      - apt-utils
+      - devscripts
+    plugin: nil
+    source: https://git.launchpad.net/~ubuntu-core-dev/ubuntu/+source/systemd
+    source-type: git
+    source-branch: ubuntu-noble
+    override-pull: |
+      "${CRAFT_PROJECT_DIR}/build-package.sh" pull
+      patch -p1 <"${CRAFT_PROJECT_DIR}/myfix.patch"
+      version="$(dpkg-parsechangelog -SVersion)+fixwritablepath"
+      NAME="Just for test" DEBEMAIL="test@example.com" dch "${version}" "Fix writable path"
+    override-build: |
+      DEB_BUILD_OPTIONS=nocheck "${CRAFT_PROJECT_DIR}/build-package.sh" build
+    override-stage: |
+      "${CRAFT_PROJECT_DIR}/build-package.sh" stage
+    prime:
+      - -local-debs
+
   base:
     plugin: nil
     source: keyrings
@@ -89,6 +109,7 @@ parts:
       - probert-deb
       - consoleconf-deb
       - base
+      - systemd
     plugin: make
     source: .
     build-packages:
